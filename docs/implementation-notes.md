@@ -71,15 +71,25 @@ inference from reproducing it, not something the card states.
 
 - **Video needs an explicit frame rate.** Gemini samples video at about 1 fps unless the part carries
   `video_metadata: {fps}`: a 20-frame clip arrived as one frame (the model read a single number out of 20). Every video
-  part in `agent.py` sets `fps`. At 256x256 a frame costs about 64 to 73 tokens (about 146 for the 512x256 side-by-side
-  tile), so a 10-step chunk shown every second step (6 frames) adds about 400 tokens per call.
-- **History is the conversation.** Each turn is sent with all earlier turns, and the model's own replies go back
-  verbatim (so any thought signatures survive). The prompt grows linearly: about 5.5k tokens after 6 calls.
+  part in `agent.py` sets `fps`.
+- **Resolution is a token budget, not pixels.** A 256 px and a 480 px frame cost the same: 64 tokens per video frame
+  and 1,089 per still image by default. `generationConfig.mediaResolution = MEDIA_RESOLUTION_HIGH` makes video frames
+  262 tokens each (4x) and leaves stills unchanged; LOW makes stills 256. In a fine-detail question the 256 px and 480 px
+  stills both read the text on the objects, and 480 px added one more label colour. Rendering at 480 px costs nothing:
+  7 ms per simulator step at either size.
+- **What grows the prompt.** A reply is pretty-printed JSON of about 430 tokens, and it carries a `thoughtSignature`
+  (1.4 to 4.5k characters) that Gemini charges again, as hidden thinking, when the reply is sent back (about 300 to 400
+  extra tokens per turn). The history therefore stores each reply as one-line JSON without the signature (about 360
+  tokens per turn instead of 750 to 850), and replies older than 3 turns keep only the observation, the plan and a
+  summary of the actions (about 95 tokens per turn). The raw replies stay in `calls.jsonl`.
+- **Caching.** Gemini caches repeated prefixes on its own (implicit caching: `cachedContentTokenCount` in the usage
+  metadata, partial). Explicit caching (`createCachedContent`) is not offered for `gemini-4-argon`, but is for
+  `gemini-robotics-er-2-preview`. The harness does not use it.
 - **Action scale, measured in the simulator** (task 0, constant action for 10 steps from rest): 1.0 on dx, dy or dz
   moves the end effector 1.0 to 1.4 cm per step, 1.0 on a rotation axis 3.4 to 5.3 degrees per step, gripper +1 closes
-  and -1 opens. In the upright agentview image (LIBERO renders upside down, the policies' preprocessing rotates it by
-  180 degrees, and so does `agent.py`) +x moves the gripper toward the camera (down), +y to the left and +z up. The system
-  prompt states this in image terms.
+  and -1 opens (it takes 10 to 15 steps to close fully). In the upright agentview image (LIBERO renders upside down, the
+  policies' preprocessing rotates it by 180 degrees, and so does `agent.py`) +x moves the gripper toward the camera
+  (down), +y to the left and +z up. The system prompt states this in image terms.
 - **Keys.** The API key is read from `GEMINI_API_KEY`, else `~/.config/gemini/api_key`, and sent in a header; it is
   never written to the logs.
 

@@ -2,10 +2,11 @@
 
     ./eval.sh agent --task-id 0
 
-Every call is one turn of a single chat, so the model remembers its own earlier actions. Each turn adds a short video
-of the last `--chunk` steps (agentview and wrist side by side) and the model answers with the next `--chunk` actions,
-which are executed open loop. Everything is written as the run goes, so killing it loses nothing:
-`outputs/agent/<run>/` holds config.json, calls.jsonl (every raw reply), clips/ (the video sent each turn),
+Every call is one turn of a single chat. Each turn shows the model the last `--window` seconds as a video (agentview
+and wrist side by side) plus the current image of each camera, and the model answers with the next `--chunk` actions,
+which are executed open loop. The chat keeps the model's own answers as text; the videos and images of earlier turns are
+dropped, so the prompt grows slowly. Everything is written as the run goes, so killing it loses nothing:
+`outputs/agent/<run>/` holds config.json, calls.jsonl (every raw reply), clips/ (the media sent each turn),
 episode.mp4 (the whole rollout) and summary.json.
 
 The 7-D action is the LIBERO command `[dx, dy, dz, droll, dpitch, dyaw, gripper]` in [-1, 1].
@@ -13,6 +14,7 @@ The 7-D action is the LIBERO command `[dx, dy, dz, droll, dpitch, dyaw, gripper]
 
 import argparse
 import base64
+import io
 import json
 import os
 import signal
@@ -43,12 +45,14 @@ FPS = 20  # control rate of the simulator
 SYSTEM = """You control a Franka Panda robot arm in a tabletop simulator (LIBERO) and must complete this task:
 "{task}"
 
-You act in rounds. In every round you see a short video of what happened since your last action chunk, and you
-answer with the next {chunk} actions, which are executed one after the other at {fps} Hz ({seconds:.1f} s in total)
-without you seeing the result. Your earlier answers are in this conversation. The episode ends after {max_steps} steps.
+You act in rounds. In every round you get the last {window:.1f} seconds as a video (agentview and wrist side by side,
+the newest frame last, the simulator step in the corner of each view), then the current agentview and wrist images at
+full resolution. You answer with the next {chunk} actions, which are executed one after the other at {fps} Hz
+({seconds:.1f} s in total) without you seeing the result. Your earlier answers stay in this conversation as text, but
+their videos and images do not: rely on your own answers and the current images. The episode ends after {max_steps} steps.
 
-THE VIDEO. Left: the agentview camera, a fixed camera in front of the robot, looking at the table. Right: the wrist
-camera, mounted on the gripper (the gripper fingers show at its bottom). The number in the corner is the simulator step.
+THE VIEWS. Agentview: a fixed camera in front of the robot, looking at the table. Wrist: a camera mounted on the
+gripper; the gripper fingers show at the bottom of its image.
 
 THE ACTION. Seven numbers in [-1, 1]: [dx, dy, dz, droll, dpitch, dyaw, gripper].
 - dx, dy, dz move the gripper. 1.0 moves it about 1 cm per step (about 10 cm over a chunk of 10 steps).
@@ -58,13 +62,12 @@ THE ACTION. Seven numbers in [-1, 1]: [dx, dy, dz, droll, dpitch, dyaw, gripper]
 - gripper: -1 opens the fingers, +1 closes them. Keep the same value while you carry an object, or it falls.
 Actions are smoothed by a controller, so motion lags a little and keeps going for a step or two after you stop.
 
-HOW TO WORK. Say what you see and the plan for the next chunk, then give the actions. Move in steps that fit the
-distance (several steps of about 0.5 to 1.0 per axis), slow down near objects, grasp with the object between the
-fingers (check the wrist camera), and lift before moving sideways. If the last chunk did not do what you intended,
-correct it.
+HOW TO WORK. Far from an object, use large steps (0.8 to 1.0 on the axes you need to move); slow down only for the last
+few centimetres. Check the wrist camera before you close the gripper: the object must be between the fingers. If the
+last chunk did not do what you intended, correct it.
 
-Answer with JSON: "observation" (what you see now, including where the gripper is relative to the objects),
-"plan" (what the next chunk should achieve), and "actions" (a list of {chunk} lists of 7 numbers)."""
+Answer with JSON and keep it short: "observation" (one sentence, at most 25 words: where the gripper is relative to the
+target), "plan" (one sentence, at most 25 words) and "actions" ({chunk} lists of 7 numbers, one decimal each)."""
 
 
 def api_key() -> str:
@@ -79,8 +82,8 @@ def schema(chunk: int) -> dict:
     return {
         "type": "OBJECT",
         "properties": {
-            "observation": {"type": "STRING"},
-            "plan": {"type": "STRING"},
+            "observation": {"type": "STRING", "description": "one sentence, at most 25 words"},
+            "plan": {"type": "STRING", "description": "one sentence, at most 25 words"},
             "actions": {"type": "ARRAY", "items": action, "minItems": chunk, "maxItems": chunk},
         },
         "required": ["observation", "plan", "actions"],
@@ -112,16 +115,27 @@ def upright(frame: np.ndarray) -> np.ndarray:
     return frame[::-1, ::-1]
 
 
-def tile(obs: dict, step: int) -> np.ndarray:
-    """Agentview and wrist side by side, with the step number in the corner of each."""
+def views(obs: dict) -> list[np.ndarray]:
+    """Agentview and wrist, upright."""
+    return [np.ascontiguousarray(upright(obs["pixels"][key][0])) for key in ("image", "image2")]
+
+
+def tile(vs: list[np.ndarray], step: int) -> np.ndarray:
+    """The two views side by side, with the step number in the corner of each."""
     out = []
-    for key in ("image", "image2"):
-        image = Image.fromarray(np.ascontiguousarray(upright(obs["pixels"][key][0])))
+    for v in vs:
+        image = Image.fromarray(v)
         draw = ImageDraw.Draw(image)
-        draw.rectangle([0, 0, 40, 12], fill=(0, 0, 0))
-        draw.text((3, 0), str(step), fill=(255, 255, 255))
+        draw.rectangle([0, 0, 56, 18], fill=(0, 0, 0))
+        draw.text((4, 3), str(step), fill=(255, 255, 255))
         out.append(np.array(image))
     return np.concatenate(out, axis=1)
+
+
+def jpeg(image: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, "JPEG", quality=92)
+    return buffer.getvalue()
 
 
 def encode(frames: list[np.ndarray], fps: float) -> bytes:
@@ -170,51 +184,94 @@ def parse_actions(response: dict, chunk: int) -> tuple[np.ndarray | None, dict, 
     return np.clip(actions, -1.0, 1.0), reply, ""
 
 
+MEDIA_RESOLUTION = {"default": None, "low": "MEDIA_RESOLUTION_LOW", "high": "MEDIA_RESOLUTION_HIGH"}
+
+
+def summarise(actions: np.ndarray) -> str:
+    """One line for an old chunk: the net movement in cm (an action of 1.0 is about 1 cm) and the gripper."""
+    x, y, z = actions[:, :3].sum(axis=0)
+    closed = actions[:, 6] > 0
+    gripper = "closed" if closed.all() else "open" if not closed.any() else (
+        f"{'closed' if closed[-1] else 'opened'} at action {int(np.argmax(closed != closed[0])) + 1}")
+    return f"net move x {x:+.0f} cm, y {y:+.0f} cm, z {z:+.0f} cm; gripper {gripper}"
+
+
+def history_contents(entries: list[tuple], full: int) -> list[dict]:
+    """The chat so far as text: the last `full` turns with the model's reply in full, older ones with the actions
+    replaced by a one-line summary. Each entry is (user text, reply, clipped actions)."""
+    contents = []
+    for i, (text, reply, actions) in enumerate(entries):
+        if i >= len(entries) - full:
+            answer = {**reply, "actions": np.round(actions, 1).tolist()}
+        else:
+            answer = {"observation": reply.get("observation", ""), "plan": reply.get("plan", ""),
+                      "executed": summarise(actions)}  # fmt: skip
+        contents += [{"role": "user", "parts": [{"text": text}]},
+                     {"role": "model", "parts": [{"text": json.dumps(answer, separators=(",", ":"))}]}]  # fmt: skip
+    return contents
+
+
 def run(args: argparse.Namespace) -> dict:
     run_dir = args.output_dir or REPO / "outputs" / "agent" / time.strftime(f"task{args.task_id}_%Y%m%d_%H%M%S")
     (run_dir / "clips").mkdir(parents=True, exist_ok=True)
-    cfg = LiberoEnv(task="libero_10", task_ids=[args.task_id], obs_type="pixels", observation_height=256,
-                    observation_width=256, episode_length=args.max_steps)  # fmt: skip
+    cfg = LiberoEnv(task="libero_10", task_ids=[args.task_id], obs_type="pixels", observation_height=args.image_size,
+                    observation_width=args.image_size, episode_length=args.max_steps)  # fmt: skip
     env = next(iter(next(iter(make_env(cfg, n_envs=1, use_async_envs=False).values())).values()))
     obs, _ = env.reset(seed=[args.seed], options={NEW_ROLLOUT_OPTION: True})
     task = list(env.call("task_description"))[0]
     key = api_key()
 
-    system = SYSTEM.format(task=task, chunk=args.chunk, fps=FPS, seconds=args.chunk / FPS, max_steps=args.max_steps)
-    config = {"systemInstruction": {"parts": [{"text": system}]},
-              "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema(args.chunk)}}  # fmt: skip
+    window = max(1, round(args.window * FPS))  # env steps of the video
+    system = SYSTEM.format(task=task, window=args.window, chunk=args.chunk, fps=FPS, seconds=args.chunk / FPS,
+                           max_steps=args.max_steps)  # fmt: skip
+    generation = {"responseMimeType": "application/json", "responseSchema": schema(args.chunk)}
+    if MEDIA_RESOLUTION[args.media_resolution]:
+        generation["mediaResolution"] = MEDIA_RESOLUTION[args.media_resolution]
     if args.thinking_budget is not None:
-        config["generationConfig"]["thinkingConfig"] = {"thinkingBudget": args.thinking_budget}
+        generation["thinkingConfig"] = {"thinkingBudget": args.thinking_budget}
+    config = {"systemInstruction": {"parts": [{"text": system}]}, "generationConfig": generation}
     (run_dir / "config.json").write_text(json.dumps({"args": {k: str(v) for k, v in vars(args).items()}, "task": task,
                                                      "request_config": config}, indent=1))  # fmt: skip
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # `kill` ends the run through the finally block below
-    frame = tile(obs, 0)
+    current = views(obs)
+    frame = tile(current, 0)
     video = stream_video(run_dir / "episode.mp4", frame)
     video.stdin.write(frame.tobytes())
-    recent, n_new = [frame], 0  # the frames of the last chunk, and the steps in it
-    step, turns, calls, tokens, success, note = 0, [], 0, {"prompt": 0, "output": 0}, False, ""
+    recent, n_new = [frame], 0  # the last `window + 1` tiles, and the steps of the last chunk
+    history, calls, tokens, success, note, step = [], 0, {"prompt": 0, "output": 0}, False, "", 0  # history: entries
     gripper = -1.0  # the last gripper command, held if a reply is unusable
     started, status = time.time(), "running"
     print(f"task {args.task_id}: {task}", flush=True)
     try:
         while step < args.max_steps and not success:
-            # The first turn shows the starting scene; later turns the video of the last chunk.
+            turn_id, files = len(history), []
+            parts = []
             if step == 0:
-                data, fps, text = encode([recent[0]] * 2, 1), 1, "The episode starts. This is the scene."
+                parts.append({"text": "The episode starts. These are the two cameras."})
             else:
-                shown = recent[:: args.clip_stride]  # from the scene before the chunk, every n-th step
-                data, fps = encode(shown, FPS / args.clip_stride), FPS / args.clip_stride
-                text = f"{note}Steps {step - n_new} to {step} just ran. This is what happened."
-            clip = f"clips/turn_{len(turns) // 2:03d}.mp4"
-            (run_dir / clip).write_bytes(data)
-            turn = {"role": "user", "parts": [{"text": text}, video_part(data, fps),
-                                              {"text": f"Give the next {args.chunk} actions."}]}  # fmt: skip
+                parts.append({"text": f"{note}Steps {step - n_new} to {step} just ran. Here are the last "
+                                      f"{(len(recent) - 1) / FPS:.1f} s, then the current images."})  # fmt: skip
+                shown = recent[:: -args.clip_stride][::-1]  # every n-th step, ending with the current one
+                data = encode(shown, FPS / args.clip_stride)
+                files.append(f"clips/turn_{turn_id:03d}.mp4")
+                (run_dir / files[-1]).write_bytes(data)
+                parts.append(video_part(data, FPS / args.clip_stride))
+            text = parts[0]["text"]
+            if args.stills:
+                for name, image in zip(("agentview", "wrist"), current):
+                    data = jpeg(image)
+                    files.append(f"clips/turn_{turn_id:03d}_{name}.jpg")
+                    (run_dir / files[-1]).write_bytes(data)
+                    parts += [{"text": f"Current {name}:"},
+                              {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode()}}]  # fmt: skip
+            parts.append({"text": f"Give the next {args.chunk} actions."})
+            turn = {"role": "user", "parts": parts}
 
             actions, reply, error = None, {}, ""
             for attempt in range(2):  # one retry with the same request if the reply is unusable
                 t0 = time.time()
-                response = generate({**config, "contents": [*turns, turn]}, args.model, key)
+                response = generate({**config, "contents": [*history_contents(history, args.full_turns), turn]}, args.model, key)
                 latency = time.time() - t0
                 usage = response.get("usageMetadata", {})
                 tokens["prompt"] += usage.get("promptTokenCount", 0)
@@ -222,10 +279,11 @@ def run(args: argparse.Namespace) -> dict:
                 calls += 1
                 actions, reply, error = parse_actions(response, args.chunk)
                 append(run_dir / "calls.jsonl", {  # everything the model sent back, as received
-                    "call": calls, "attempt": attempt, "step": step, "clip": clip, "user_text": [text],
+                    "call": calls, "attempt": attempt, "step": step, "media": files, "user_text": text,
                     "latency_s": round(latency, 1), "usage": usage, "error": error, "response": response})  # fmt: skip
-                print(f"  call {calls} @ step {step}: {latency:.0f}s, {usage.get('promptTokenCount')} prompt tokens"
-                      f"{', ' + error if error else ''} | {reply.get('plan', '')[:110]}", flush=True)
+                print(f"  call {calls} @ step {step}: {latency:.0f}s, {usage.get('promptTokenCount')} prompt tokens, "
+                      f"{usage.get('candidatesTokenCount')} out{', ' + error if error else ''} | "
+                      f"{reply.get('plan', '')[:100]}", flush=True)  # fmt: skip
                 if actions is not None:
                     break
             if actions is None:  # hold still, keep the gripper where it was
@@ -233,20 +291,21 @@ def run(args: argparse.Namespace) -> dict:
                 note = "Your last reply could not be used, so the robot held still. "
             else:
                 note, gripper = "", float(actions[-1, 6])
-                turns += [turn, response["candidates"][0]["content"]]  # the model's own turn goes back verbatim
+                # The history keeps the text of each turn and the model's own reply, without the media and without the
+                # thought signature (it carries hidden thinking, charged again when replayed). calls.jsonl keeps the raw reply.
+                history.append((text, reply, actions))
 
-            recent, n_new = recent[-1:], 0
+            n_new = 0
             for a in actions:
                 obs, _, terminated, truncated, info = env.step(a[None].astype(np.float32))
                 step, n_new = step + 1, n_new + 1
-                recent.append(tile(obs, step))
+                current = views(obs)
+                recent = [*recent[-window:], tile(current, step)]
                 video.stdin.write(recent[-1].tobytes())
                 success = bool(np.any(info.get("is_success", False)))
                 if success or bool(np.any(terminated)) or bool(np.any(truncated)) or step >= args.max_steps:
                     break
             video.stdin.flush()
-            if success or step >= args.max_steps:
-                break
         status = "success" if success else "step limit"
     except BaseException as e:  # a kill, Ctrl-C or an API error: keep what was recorded
         status = f"interrupted: {type(e).__name__}"
@@ -256,7 +315,9 @@ def run(args: argparse.Namespace) -> dict:
         video.wait()
         summary = {"task_id": args.task_id, "task": task, "status": status, "success": success, "steps": step,
                    "calls": calls, "tokens": tokens, "wall_s": round(time.time() - started), "model": args.model,
-                   "chunk": args.chunk, "clip_stride": args.clip_stride, "seed": args.seed}  # fmt: skip
+                   "chunk": args.chunk, "window_s": args.window, "clip_stride": args.clip_stride,
+                   "stills": args.stills, "image_size": args.image_size,
+                   "media_resolution": args.media_resolution, "seed": args.seed}  # fmt: skip
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
         print(json.dumps(summary), flush=True)
     return summary
@@ -266,7 +327,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--task-id", type=int, default=0, help="LIBERO-10 task (0-9)")
     ap.add_argument("--chunk", type=int, default=10, help="actions per call")
-    ap.add_argument("--clip-stride", type=int, default=2, help="show every n-th step of the last chunk in the video")
+    ap.add_argument("--window", type=float, default=2.0, help="seconds of video shown on every call")
+    ap.add_argument("--clip-stride", type=int, default=2, help="show every n-th step of the window in the video")
+    ap.add_argument("--full-turns", type=int, default=3, help="recent turns kept with all 10 actions in the history")
+    ap.add_argument("--no-stills", dest="stills", action="store_false", help="do not send the current camera images")
+    ap.add_argument("--image-size", type=int, default=480, help="camera resolution (the policies use 256)")
+    ap.add_argument("--media-resolution", choices=list(MEDIA_RESOLUTION), default="high",
+                    help="Gemini tokens per image or video frame (high: 262 per video frame, default: 64)")
     ap.add_argument("--max-steps", type=int, default=520, help="episode length (the LIBERO-10 limit)")
     ap.add_argument("--model", default="gemini-4-argon")
     ap.add_argument("--thinking-budget", type=int, default=None, help="thinking tokens (default: the model's choice)")
