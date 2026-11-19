@@ -1,0 +1,21 @@
+[project]
+name = "agentic-libero"
+version = "0.1.0"
+description = "An agentic harness: Gemini controls a robot arm in LIBERO-10 from short videos"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "lerobot[cosmos3,vla_jepa,libero]",  # submodules/lerobot, pinned to the commit of the Cosmos3 model card
+    "hf-libero",  # submodules/LIBERO, v0.1.4 as in the model card
+    "imageio[ffmpeg]",  # rollout videos
+]
+
+[tool.uv]
+package = false
+# The model card's numbers need MuJoCo 2.3.7, but hf-libero asks for mujoco>=3. 2.3.7 has no wheel for Python 3.12,
+# so setup.sh builds it from source (see there for why the Python bindings are built with a newer pybind11).
+override-dependencies = ["mujoco==2.3.7"]
+
+[tool.uv.sources]
+lerobot = { path = "submodules/lerobot", editable = true }
+hf-libero = { path = "submodules/LIBERO", editable = true }

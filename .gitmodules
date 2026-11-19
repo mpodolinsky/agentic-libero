@@ -1,0 +1,8 @@
+[submodule "submodules/LIBERO"]
+	path = submodules/LIBERO
+	url = https://github.com/huggingface/LIBERO
+	ignore = untracked
+[submodule "submodules/lerobot"]
+	path = submodules/lerobot
+	url = https://github.com/huggingface/lerobot
+	ignore = untracked
