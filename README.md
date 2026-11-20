@@ -20,8 +20,9 @@ works too). On every turn:
 The system prompt explains the action in image terms (which way each axis moves in the agentview, about 1 cm per step
 at 1.0, +1 closes the gripper); those numbers were measured in the simulator. Invalid replies are retried once, then
 the robot holds still. Everything is written as the run goes, so killing it loses nothing: `outputs/agent/<run>/` has
-`calls.jsonl` (every raw reply of the model, with latency and token usage), `clips/` (the media sent on each turn),
-`episode.mp4` (the whole rollout, both cameras), `config.json` and `summary.json`.
+`calls.jsonl` (every raw reply of the model, with latency and token usage), `clips/` (the media sent on each turn;
+deleted when an episode finishes, unless `--keep-clips`), `episode.mp4` (the whole rollout, both cameras), `config.json`
+and `summary.json`.
 
 ## Setup
 
@@ -32,7 +33,10 @@ git clone --recurse-submodules https://github.com/mpodolinsky/agentic-libero && 
 ./setup.sh
 ```
 
-A Gemini API key is read from `GEMINI_API_KEY`, else from `~/.config/gemini/api_key`. Details of the environment
+Gemini access is keyless by default: the agent calls Vertex AI with your Google Cloud application default credentials
+(`gcloud auth application-default login`; the project comes from `--project`, `GOOGLE_CLOUD_PROJECT` or the gcloud
+config, and `gcloud` is found on the PATH or in `~/google-cloud-sdk/bin`). `--auth key` uses a Gemini API key instead
+(`GEMINI_API_KEY`, else `~/.config/gemini/api_key`). Details of the environment
 (pinned versions, the MuJoCo 2.3.7 build the simulator relies on): [docs/implementation-notes.md](docs/implementation-notes.md).
 
 ## Run
@@ -61,7 +65,10 @@ The first version asks the model for the raw 7-D action, as a baseline. Directio
 
 ## Results
 
-Task 0 ("put both the alphabet soup and the tomato sauce in the basket"), one seed, one episode per model: these are
+All 10 tasks, one episode each, with `gemini-4-argon`: 1 of 10 succeeded; see [results/](results/README.md) for the table
+and a GIF of every episode.
+
+Earlier, on task 0 ("put both the alphabet soup and the tomato sauce in the basket"), one seed, one episode per model: these are
 observations, not results. Neither model completed the task.
 
 | model | steps run | calls | prompt tokens at the end | seconds per call | what happened |

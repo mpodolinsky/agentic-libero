@@ -6,8 +6,8 @@ Every call is one turn of a single chat. Each turn shows the model the last `--w
 and wrist side by side) plus the current image of each camera, and the model answers with the next `--chunk` actions,
 which are executed open loop. The chat keeps the model's own answers as text; the videos and images of earlier turns are
 dropped, so the prompt grows slowly. Everything is written as the run goes, so killing it loses nothing:
-`outputs/agent/<run>/` holds config.json, calls.jsonl (every raw reply), clips/ (the media sent each turn),
-episode.mp4 (the whole rollout) and summary.json.
+`outputs/agent/<run>/` holds config.json, calls.jsonl (every raw reply), clips/ (the media sent each turn, deleted
+when an episode finishes unless --keep-clips), episode.mp4 (the whole rollout) and summary.json.
 
 The 7-D action is the LIBERO command `[dx, dy, dz, droll, dpitch, dyaw, gripper]` in [-1, 1].
 """
@@ -17,6 +17,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -38,7 +40,8 @@ from lerobot.envs.configs import LiberoEnv  # noqa: E402
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"  # with an API key
+VERTEX = "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/models/{model}:generateContent"
 FPS = 20  # control rate of the simulator
 
 # What an action of 1.0 does, measured in the simulator (about 1 cm and 3 to 5 degrees per step, from rest).
@@ -91,13 +94,35 @@ def schema(chunk: int) -> dict:
     }
 
 
-def generate(body: dict, model: str, key: str, retries: int = 4) -> dict:
+def gcloud() -> str:
+    return shutil.which("gcloud") or str(Path("~/google-cloud-sdk/bin/gcloud").expanduser())
+
+
+def endpoint(args: argparse.Namespace) -> tuple[str, Callable[[], dict]]:
+    """The generateContent URL and a function that gives the headers of a request. By default Vertex AI with the
+    application default credentials of `gcloud` (no key); with `--auth key`, the Gemini API with an API key."""
+    if args.auth == "key":
+        key = api_key()
+        return API.format(model=args.model), lambda: {"x-goog-api-key": key}
+    project = args.project or os.environ.get("GOOGLE_CLOUD_PROJECT") or subprocess.run(
+        [gcloud(), "config", "get-value", "project"], capture_output=True, text=True, check=True).stdout.strip()  # fmt: skip
+    token = {"value": "", "time": 0.0}
+
+    def headers() -> dict:
+        if time.time() - token["time"] > 1800:  # access tokens last an hour
+            token["value"] = subprocess.run([gcloud(), "auth", "application-default", "print-access-token"],
+                                            capture_output=True, text=True, check=True).stdout.strip()  # fmt: skip
+            token["time"] = time.time()
+        return {"Authorization": f"Bearer {token['value']}", "x-goog-user-project": project}
+
+    return VERTEX.format(project=project, model=args.model), headers
+
+
+def generate(body: dict, url: str, headers: Callable[[], dict], retries: int = 4) -> dict:
     """One generateContent call; backs off on rate limits and server errors."""
-    request = urllib.request.Request(
-        API.format(model=model), data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-    )  # fmt: skip
     for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json", **headers()})  # fmt: skip
         try:
             return json.load(urllib.request.urlopen(request, timeout=300))
         except urllib.error.HTTPError as e:
@@ -219,7 +244,7 @@ def run(args: argparse.Namespace) -> dict:
     env = next(iter(next(iter(make_env(cfg, n_envs=1, use_async_envs=False).values())).values()))
     obs, _ = env.reset(seed=[args.seed], options={NEW_ROLLOUT_OPTION: True})
     task = list(env.call("task_description"))[0]
-    key = api_key()
+    url, headers = endpoint(args)
 
     window = max(1, round(args.window * FPS))  # env steps of the video
     system = SYSTEM.format(task=task, window=args.window, chunk=args.chunk, fps=FPS, seconds=args.chunk / FPS,
@@ -271,7 +296,7 @@ def run(args: argparse.Namespace) -> dict:
             actions, reply, error = None, {}, ""
             for attempt in range(2):  # one retry with the same request if the reply is unusable
                 t0 = time.time()
-                response = generate({**config, "contents": [*history_contents(history, args.full_turns), turn]}, args.model, key)
+                response = generate({**config, "contents": [*history_contents(history, args.full_turns), turn]}, url, headers)
                 latency = time.time() - t0
                 usage = response.get("usageMetadata", {})
                 tokens["prompt"] += usage.get("promptTokenCount", 0)
@@ -319,6 +344,8 @@ def run(args: argparse.Namespace) -> dict:
                    "stills": args.stills, "image_size": args.image_size,
                    "media_resolution": args.media_resolution, "seed": args.seed}  # fmt: skip
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
+        if status in ("success", "step limit") and not args.keep_clips:  # an interrupted run keeps its clips
+            shutil.rmtree(run_dir / "clips", ignore_errors=True)
         print(json.dumps(summary), flush=True)
     return summary
 
@@ -330,12 +357,16 @@ if __name__ == "__main__":
     ap.add_argument("--window", type=float, default=2.0, help="seconds of video shown on every call")
     ap.add_argument("--clip-stride", type=int, default=2, help="show every n-th step of the window in the video")
     ap.add_argument("--full-turns", type=int, default=3, help="recent turns kept with all 10 actions in the history")
+    ap.add_argument("--keep-clips", action="store_true", help="keep clips/ after a finished episode (default: delete)")
     ap.add_argument("--no-stills", dest="stills", action="store_false", help="do not send the current camera images")
     ap.add_argument("--image-size", type=int, default=480, help="camera resolution (the policies use 256)")
     ap.add_argument("--media-resolution", choices=list(MEDIA_RESOLUTION), default="high",
                     help="Gemini tokens per image or video frame (high: 262 per video frame, default: 64)")
     ap.add_argument("--max-steps", type=int, default=520, help="episode length (the LIBERO-10 limit)")
     ap.add_argument("--model", default="gemini-4-argon")
+    ap.add_argument("--auth", choices=["adc", "key"], default="adc",
+                    help="adc: Vertex AI with the gcloud application default credentials (no key); key: Gemini API key")
+    ap.add_argument("--project", default=None, help="Google Cloud project (default: GOOGLE_CLOUD_PROJECT, else gcloud's)")
     ap.add_argument("--thinking-budget", type=int, default=None, help="thinking tokens (default: the model's choice)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output-dir", type=Path, default=None)

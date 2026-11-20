@@ -90,8 +90,10 @@ inference from reproducing it, not something the card states.
   and -1 opens (it takes 10 to 15 steps to close fully). In the upright agentview image (LIBERO renders upside down, the
   policies' preprocessing rotates it by 180 degrees, and so does `agent.py`) +x moves the gripper toward the camera
   (down), +y to the left and +z up. The system prompt states this in image terms.
-- **Keys.** The API key is read from `GEMINI_API_KEY`, else `~/.config/gemini/api_key`, and sent in a header; it is
-  never written to the logs.
+- **Access.** By default requests go to Vertex AI (`aiplatform.googleapis.com`, global location) with a short-lived
+  bearer token from `gcloud auth application-default print-access-token`, refreshed every 30 minutes, and no key. With
+  `--auth key` the Gemini API is used with `GEMINI_API_KEY` or `~/.config/gemini/api_key`, sent in a header. Neither
+  the token nor the key is written to the logs.
 
 ## Policies
 
